@@ -230,11 +230,11 @@ def _preprocess_case(
     cleaned = _clean_raw_case(raw_case, require_target=False)
     disease = cleaned["disease_type"]
     known_diseases = {column.replace("disease_type_", "") for column in disease_cols}
-    if disease not in known_diseases:
-        raise ValueError(
-            "disease_type tidak dikenali. Gunakan salah satu: "
-            f"{', '.join(sorted(known_diseases))}."
-        )
+    # if disease not in known_diseases:
+    #     raise ValueError(
+    #         "disease_type tidak dikenali. Gunakan salah satu: "
+    #         f"{', '.join(sorted(known_diseases))}."
+    #     )
 
     processed = {
         feature: _scale_feature(feature, cleaned[feature], ranges)
@@ -562,18 +562,18 @@ def recommend(
             revised_result["weighted_euclidean_distance"] = best_case[
                 "weighted_euclidean_distance"
             ]
-            
-            # Mencegah duplikasi: Hanya retain jika similarity tertinggi (global_similarity)
-            # masih di bawah 99%. Jika 99% atau 100%, berarti kasus ini sudah ada di database,
-            similarity = revised_result.get('global_similarity')
-            
-            if similarity is None or similarity < 0.99:
-                print("[SYSTEM] Kasus Rule-Based baru terdeteksi. Menyimpan ke Case Base...")
-                # Simpan diam-diam di background
-                retain_case(query_case, revised_result['diet_recommendation'])
-                revised_result['retain_status'] = "AUTO_RETAINED"
-            else:
-                revised_result['retain_status'] = "IGNORED_DUPLICATE"
+            if revised_result["status"] == "REVISE":
+                # Mencegah duplikasi: Hanya retain jika similarity tertinggi (global_similarity)
+                # masih di bawah 99%. Jika 99% atau 100%, berarti kasus ini sudah ada di database,
+                similarity = revised_result.get('global_similarity')
+                
+                if similarity is None or similarity < 0.99:
+                    print("[SYSTEM] Kasus Rule-Based baru terdeteksi. Menyimpan ke Case Base...")
+                    # Simpan diam-diam di background
+                    retain_case(query_case, revised_result['diet_recommendation'])
+                    revised_result['retain_status'] = "AUTO_RETAINED"
+                else:
+                    revised_result['retain_status'] = "IGNORED_DUPLICATE"
         else:
             revised_result["global_similarity"] = None
             revised_result["weighted_euclidean_distance"] = None
