@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -9,11 +10,22 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CASE_BASE_PATH = BASE_DIR / "diet_case_base.csv"
 DEFAULT_NEED_REVISE_PATH = BASE_DIR / "need_revise_case.csv"
-TARGET_COLUMN = "diet_recommendation"
-LABEL_COLUMN = "diet_recommendation_label"
 
+TARGET_COLUMN = "diet_recommendation"
+LABEL_COLUMN = TARGET_COLUMN
+PATIENT_ID_COLUMN = "patient_id"
 RAW_NUMERIC_FEATURES = ["bmi", "cholesterol", "blood_pressure", "age", "glucose"]
-DISEASE_PREFIX = "disease_type_"
+RAW_CASE_COLUMNS = [
+    PATIENT_ID_COLUMN,
+    "age",
+    "bmi",
+    "disease_type",
+    "cholesterol",
+    "glucose",
+    "blood_pressure",
+    TARGET_COLUMN,
+]
+
 DISEASE_ALIASES = {
     "": "none",
     "normal": "none",
@@ -27,17 +39,7 @@ DISEASE_ALIASES = {
     "obesitas": "obesity",
 }
 
-# Rentang ini dipakai untuk mengubah input mentah menjadi skala 0-1 yang
-# sama dengan case base saat ini. Jika input sudah 0-1, nilainya tetap dipakai.
-RAW_FEATURE_RANGES = {
-    "bmi": (10.0, 50.0),
-    "cholesterol": (100.0, 300.0),
-    "blood_pressure": (70.0, 180.0),
-    "age": (0.0, 100.0),
-    "glucose": (70.0, 250.0),
-}
-
-weights = {
+WEIGHT_CONFIG = {
     "disease_type": 0.30,
     "bmi": 0.20,
     "cholesterol": 0.15,
@@ -46,31 +48,7 @@ weights = {
     "glucose": 0.10,
 }
 
-NEED_REVISE_COLUMNS = [
-    "bmi",
-    "cholesterol",
-    "blood_pressure",
-    "age",
-    "glucose",
-    "disease_type",
-    "reason",
-]
-
-SOLUTION_LABELS = {
-    "0": "balanced",
-    "1": "low_carb",
-    "2": "low_sodium",
-}
-
-
-def normalize_weights(raw_weights: dict[str, float]) -> dict[str, float]:
-    total = sum(raw_weights.values())
-    if total <= 0:
-        raise ValueError("Total weight harus lebih dari 0.")
-    return {feature: value / total for feature, value in raw_weights.items()}
-
-
-WEIGHTS = normalize_weights(weights)
+_CASE_BASE_CACHE: dict[str, Any] | None = None
 
 
 def _to_float(value: Any, default: float | None = 0.0) -> float:
@@ -81,103 +59,376 @@ def _to_float(value: Any, default: float | None = 0.0) -> float:
     return float(value)
 
 
-def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
-    return max(lower, min(upper, value))
-
-
-def _normalize_feature(feature: str, value: Any) -> float:
-    numeric_value = _to_float(value, default=None)
-    if 0.0 <= numeric_value <= 1.0:
-        return numeric_value
-
-    minimum, maximum = RAW_FEATURE_RANGES[feature]
-    if maximum <= minimum:
-        raise ValueError(f"Range fitur {feature} tidak valid.")
-
-    return _clip((numeric_value - minimum) / (maximum - minimum))
-
-
 def _normalize_disease(value: Any) -> str:
     disease = str(value or "none").strip().lower().replace("-", " ").replace("_", " ")
     return DISEASE_ALIASES.get(disease, disease)
 
 
+def _normalize_target(value: Any) -> str:
+    label = str(value or "").strip().lower()
+    aliases = {
+        "0": "balanced",
+        "1": "low_carb",
+        "2": "low_sodium",
+        "balanced": "balanced",
+        "low carb": "low_carb",
+        "low_carb": "low_carb",
+        "low sodium": "low_sodium",
+        "low_sodium": "low_sodium",
+    }
+    return aliases.get(label, label)
+
+
 def solution_label(value: Any) -> str | None:
     if value is None or value == "":
         return None
-    return SOLUTION_LABELS.get(str(value), str(value))
+    return _normalize_target(value)
 
 
-def _raw_numeric_case(raw_case: dict[str, Any]) -> dict[str, float]:
-    missing_features = [feature for feature in RAW_NUMERIC_FEATURES if feature not in raw_case]
+def _clean_raw_case(row: dict[str, Any], require_target: bool = True) -> dict[str, Any]:
+    missing_features = [feature for feature in RAW_NUMERIC_FEATURES if feature not in row]
     if missing_features:
         raise ValueError(f"Input kurang fitur: {', '.join(missing_features)}")
 
-    return {
-        feature: _to_float(raw_case[feature], default=None)
+    cleaned = {
+        PATIENT_ID_COLUMN: str(row.get(PATIENT_ID_COLUMN, "")).strip(),
+        "age": _to_float(row.get("age"), default=None),
+        "bmi": _to_float(row.get("bmi"), default=None),
+        "disease_type": _normalize_disease(row.get("disease_type")),
+        "cholesterol": _to_float(row.get("cholesterol"), default=None),
+        "glucose": _to_float(row.get("glucose"), default=None),
+        "blood_pressure": _to_float(row.get("blood_pressure"), default=None),
+    }
+
+    if require_target:
+        if TARGET_COLUMN not in row or row.get(TARGET_COLUMN) == "":
+            raise ValueError(f"Kolom {TARGET_COLUMN} wajib ada pada case base.")
+        cleaned[TARGET_COLUMN] = _normalize_target(row[TARGET_COLUMN])
+    elif TARGET_COLUMN in row:
+        cleaned[TARGET_COLUMN] = _normalize_target(row[TARGET_COLUMN])
+
+    return cleaned
+
+
+def _fill_missing_numeric_with_median(cases: list[dict[str, Any]]) -> None:
+    for feature in RAW_NUMERIC_FEATURES:
+        values = sorted(
+            _to_float(case.get(feature), default=0.0)
+            for case in cases
+            if case.get(feature) not in {None, ""}
+        )
+        if not values:
+            median = 0.0
+        elif len(values) % 2:
+            median = values[len(values) // 2]
+        else:
+            mid = len(values) // 2
+            median = (values[mid - 1] + values[mid]) / 2
+
+        for case in cases:
+            if case.get(feature) in {None, ""}:
+                case[feature] = median
+
+
+def load_case_base(path: str | Path = DEFAULT_CASE_BASE_PATH) -> list[dict[str, Any]]:
+    case_base_path = Path(path)
+    with case_base_path.open(newline="", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None:
+            raise ValueError(f"Case base kosong: {case_base_path}")
+
+        cases = [_clean_raw_case(row, require_target=True) for row in reader]
+
+    if not cases:
+        raise ValueError(f"Case base kosong: {case_base_path}")
+
+    _fill_missing_numeric_with_median(cases)
+    return cases
+
+
+def case_base_columns(path: str | Path = DEFAULT_CASE_BASE_PATH) -> list[str]:
+    with Path(path).open(newline="", encoding="utf-8") as file:
+        reader = csv.reader(file)
+        try:
+            return next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"Case base kosong: {path}") from exc
+
+
+def bmi_category(value: float) -> str:
+    if value < 18.5:
+        return "UW"
+    if value < 25.0:
+        return "NR"
+    if value < 30.0:
+        return "OW"
+    return "OB"
+
+
+def bp_category(value: float) -> str:
+    if value < 120:
+        return "Low"
+    if value < 130:
+        return "Normal"
+    if value < 140:
+        return "High1"
+    return "High2"
+
+
+def build_index_key(disease: Any, bmi_value: Any, blood_pressure_value: Any) -> str:
+    disease_key = _normalize_disease(disease).replace(" ", "_")
+    return (
+        f"{disease_key}_"
+        f"{bmi_category(_to_float(bmi_value, default=None))}_"
+        f"{bp_category(_to_float(blood_pressure_value, default=None))}"
+    )
+
+
+def _fit_minmax(cases: list[dict[str, Any]]) -> dict[str, tuple[float, float]]:
+    ranges = {}
+    for feature in RAW_NUMERIC_FEATURES:
+        values = [_to_float(case[feature], default=0.0) for case in cases]
+        ranges[feature] = (min(values), max(values))
+    return ranges
+
+
+def _scale_feature(feature: str, value: Any, ranges: dict[str, tuple[float, float]]) -> float:
+    minimum, maximum = ranges[feature]
+    numeric_value = _to_float(value, default=None)
+    if maximum == minimum:
+        return 0.0
+    return max(0.0, min(1.0, (numeric_value - minimum) / (maximum - minimum)))
+
+
+def _disease_columns(cases: list[dict[str, Any]]) -> list[str]:
+    diseases = sorted({_normalize_disease(case["disease_type"]) for case in cases})
+    return [f"disease_type_{disease}" for disease in diseases]
+
+
+def _feature_order(disease_cols: list[str]) -> list[str]:
+    return RAW_NUMERIC_FEATURES + disease_cols
+
+
+def _column_weights(disease_cols: list[str]) -> dict[str, float]:
+    weights = {feature: WEIGHT_CONFIG[feature] for feature in RAW_NUMERIC_FEATURES}
+    if not disease_cols:
+        return weights
+
+    disease_weight = WEIGHT_CONFIG["disease_type"] / len(disease_cols)
+    for column in disease_cols:
+        weights[column] = disease_weight
+
+    total = sum(weights.values())
+    return {feature: value / total for feature, value in weights.items()}
+
+
+def _preprocess_case(
+    raw_case: dict[str, Any],
+    ranges: dict[str, tuple[float, float]],
+    disease_cols: list[str],
+) -> dict[str, float]:
+    cleaned = _clean_raw_case(raw_case, require_target=False)
+    disease = cleaned["disease_type"]
+    known_diseases = {column.replace("disease_type_", "") for column in disease_cols}
+    if disease not in known_diseases:
+        raise ValueError(
+            "disease_type tidak dikenali. Gunakan salah satu: "
+            f"{', '.join(sorted(known_diseases))}."
+        )
+
+    processed = {
+        feature: _scale_feature(feature, cleaned[feature], ranges)
         for feature in RAW_NUMERIC_FEATURES
+    }
+    for column in disease_cols:
+        processed[column] = 1.0 if column == f"disease_type_{disease}" else 0.0
+    return processed
+
+
+def _vectorize(processed_case: dict[str, float], feature_order: list[str]) -> list[float]:
+    return [processed_case[feature] for feature in feature_order]
+
+
+def _build_case_base_cache(path: str | Path = DEFAULT_CASE_BASE_PATH) -> dict[str, Any]:
+    raw_cases = load_case_base(path)
+    ranges = _fit_minmax(raw_cases)
+    disease_cols = _disease_columns(raw_cases)
+    feature_order = _feature_order(disease_cols)
+    weights = _column_weights(disease_cols)
+    weight_vector = [weights[feature] for feature in feature_order]
+
+    processed_cases = [
+        _preprocess_case(case, ranges, disease_cols)
+        for case in raw_cases
+    ]
+    vectors = [_vectorize(case, feature_order) for case in processed_cases]
+    targets = [case[TARGET_COLUMN] for case in raw_cases]
+
+    hash_table: dict[str, list[int]] = defaultdict(list)
+    for index, case in enumerate(raw_cases):
+        key = build_index_key(
+            case["disease_type"],
+            case["bmi"],
+            case["blood_pressure"],
+        )
+        hash_table[key].append(index)
+
+    return {
+        "raw_cases": raw_cases,
+        "processed_cases": processed_cases,
+        "vectors": vectors,
+        "targets": targets,
+        "ranges": ranges,
+        "disease_cols": disease_cols,
+        "feature_order": feature_order,
+        "weights": weights,
+        "weight_vector": weight_vector,
+        "hash_table": dict(hash_table),
     }
 
 
-def _is_normalized_case(numeric_case: dict[str, float]) -> bool:
-    return all(0.0 <= value <= 1.0 for value in numeric_case.values())
+def get_case_base_cache(
+    path: str | Path = DEFAULT_CASE_BASE_PATH,
+    force_reload: bool = False,
+) -> dict[str, Any]:
+    global _CASE_BASE_CACHE
+    if _CASE_BASE_CACHE is None or force_reload:
+        _CASE_BASE_CACHE = _build_case_base_cache(path)
+    return _CASE_BASE_CACHE
 
 
-def _denormalize_feature(feature: str, value: float) -> float:
-    minimum, maximum = RAW_FEATURE_RANGES[feature]
-    return minimum + (value * (maximum - minimum))
+def _weighted_distance(
+    query_vector: list[float],
+    case_vector: list[float],
+    weight_vector: list[float],
+) -> float:
+    total = 0.0
+    for query_value, case_value, weight in zip(query_vector, case_vector, weight_vector):
+        total += weight * ((case_value - query_value) ** 2)
+    return math.sqrt(total)
 
 
-def raw_case_for_rules(raw_case: dict[str, Any]) -> dict[str, Any]:
-    numeric_case = _raw_numeric_case(raw_case)
-    if _is_normalized_case(numeric_case):
-        numeric_case = {
-            feature: _denormalize_feature(feature, value)
-            for feature, value in numeric_case.items()
-        }
+def _rank_indexed_candidates(
+    query_case: dict[str, Any],
+    cache: dict[str, Any],
+    k: int,
+) -> tuple[list[dict[str, Any]], str, int, bool, dict[str, float]]:
+    processed_query = _preprocess_case(
+        query_case,
+        cache["ranges"],
+        cache["disease_cols"],
+    )
+    query_vector = _vectorize(processed_query, cache["feature_order"])
+    cleaned_query = _clean_raw_case(query_case, require_target=False)
+    index_key = build_index_key(
+        cleaned_query["disease_type"],
+        cleaned_query["bmi"],
+        cleaned_query["blood_pressure"],
+    )
+
+    candidates = cache["hash_table"].get(index_key, [])
+    used_fallback = len(candidates) < k
+    if used_fallback:
+        candidates = list(range(len(cache["raw_cases"])))
+
+    ranked = []
+    for index in candidates:
+        distance = _weighted_distance(
+            query_vector,
+            cache["vectors"][index],
+            cache["weight_vector"],
+        )
+        similarity = max(0.0, min(1.0, 1.0 - distance))
+        result = dict(cache["raw_cases"][index])
+        result["case_index"] = index
+        result["index_key"] = index_key
+        result["weighted_euclidean_distance"] = distance
+        result["global_similarity"] = similarity
+        ranked.append(result)
+
+    ranked.sort(key=lambda case: (case["weighted_euclidean_distance"], -case["global_similarity"]))
+    return ranked, index_key, len(candidates), used_fallback, processed_query
+
+
+def _majority_vote(top_cases: list[dict[str, Any]]) -> str:
+    counts = Counter(case[TARGET_COLUMN] for case in top_cases)
+    max_count = max(counts.values())
+    tied_labels = {label for label, count in counts.items() if count == max_count}
+    if len(tied_labels) == 1:
+        return next(iter(tied_labels))
+
+    avg_distances = {}
+    for label in tied_labels:
+        distances = [
+            case["weighted_euclidean_distance"]
+            for case in top_cases
+            if case[TARGET_COLUMN] == label
+        ]
+        avg_distances[label] = sum(distances) / len(distances)
+    return min(avg_distances, key=avg_distances.get)
+
+
+def retrieve(
+    query_case: dict[str, Any],
+    k: int = 5,
+    similarity_threshold: float = 0.75,
+    cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if k <= 0:
+        raise ValueError("k harus lebih dari 0.")
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise ValueError("similarity_threshold harus berada pada rentang 0 sampai 1.")
+
+    case_cache = cache if cache is not None else get_case_base_cache()
+    ranked, index_key, candidate_count, used_fallback, processed_query = _rank_indexed_candidates(
+        query_case,
+        case_cache,
+        k,
+    )
+    qualified = [
+        case
+        for case in ranked
+        if case["global_similarity"] >= similarity_threshold
+    ][:k]
 
     return {
-        **numeric_case,
-        "disease_type": _normalize_disease(raw_case.get("disease_type")),
+        "cases": qualified,
+        "ranked_cases": ranked,
+        "index_key": index_key,
+        "candidate_count": candidate_count,
+        "used_fallback": used_fallback,
+        "processed_query": processed_query,
     }
 
 
 def revise_by_rules(raw_case: dict[str, Any]) -> dict[str, Any] | None:
-    case = raw_case_for_rules(raw_case)
+    case = _clean_raw_case(raw_case, require_target=False)
     disease = case["disease_type"]
-    bmi = case["bmi"]
-    cholesterol = case["cholesterol"]
-    blood_pressure = case["blood_pressure"]
-    glucose = case["glucose"]
 
-    if disease == "diabetes" or glucose >= 126:
+    if disease == "diabetes" or case["glucose"] >= 126:
         return {
-            "diet_recommendation": "1",
-            "diet_recommendation_label": solution_label("1"),
+            "diet_recommendation": "low_carb",
             "rule": "diabetes_or_high_glucose",
             "reason": "disease_type diabetes atau glucose >= 126.",
         }
 
-    if disease == "hypertension" or blood_pressure >= 140:
+    if disease == "hypertension" or case["blood_pressure"] >= 140:
         return {
-            "diet_recommendation": "2",
-            "diet_recommendation_label": solution_label("2"),
+            "diet_recommendation": "low_sodium",
             "rule": "hypertension_or_high_blood_pressure",
             "reason": "disease_type hypertension atau blood_pressure >= 140.",
         }
 
-    if disease == "obesity" or bmi >= 30:
+    if disease == "obesity" or case["bmi"] >= 30:
         return {
-            "diet_recommendation": "0",
-            "diet_recommendation_label": solution_label("0"),
+            "diet_recommendation": "balanced",
             "rule": "obesity_or_high_bmi",
             "reason": "disease_type obesity atau bmi >= 30.",
         }
 
-    if cholesterol >= 240:
+    if case["cholesterol"] >= 240:
         return {
-            "diet_recommendation": "0",
-            "diet_recommendation_label": solution_label("0"),
+            "diet_recommendation": "balanced",
             "rule": "high_cholesterol",
             "reason": "cholesterol >= 240.",
         }
@@ -185,270 +436,82 @@ def revise_by_rules(raw_case: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def load_case_base(path: str | Path = DEFAULT_CASE_BASE_PATH) -> list[dict[str, Any]]:
-    case_base_path = Path(path)
-    with case_base_path.open(newline="", encoding="utf-8") as file:
-        reader = csv.DictReader(file)
-        cases = []
+def _next_need_revise_patient_id(path: str | Path = DEFAULT_NEED_REVISE_PATH) -> str:
+    revise_path = Path(path)
+    if not revise_path.exists() or revise_path.stat().st_size == 0:
+        return "REV0001"
 
-        for row in reader:
-            case = {}
-            for column, value in row.items():
-                if column in {TARGET_COLUMN, LABEL_COLUMN}:
-                    case[column] = value
-                else:
-                    case[column] = _to_float(value)
-            cases.append(case)
-
-    if not cases:
-        raise ValueError(f"Case base kosong: {case_base_path}")
-
-    return cases
-
-
-def case_base_columns(path: str | Path = DEFAULT_CASE_BASE_PATH) -> list[str]:
-    case_base_path = Path(path)
-    with case_base_path.open(newline="", encoding="utf-8") as file:
-        reader = csv.reader(file)
-        try:
-            return next(reader)
-        except StopIteration as exc:
-            raise ValueError(f"Case base kosong: {case_base_path}") from exc
+    with revise_path.open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    return f"REV{len(rows) + 1:04d}"
 
 
 def save_need_revise_case(
     raw_case: dict[str, Any],
-    reason: str,
     path: str | Path = DEFAULT_NEED_REVISE_PATH,
 ) -> dict[str, Any]:
-    need_revise_path = Path(path)
-    need_revise_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not need_revise_path.exists() or need_revise_path.stat().st_size == 0
-
+    cleaned = _clean_raw_case(raw_case, require_target=False)
     row = {
-        "bmi": raw_case.get("bmi", ""),
-        "cholesterol": raw_case.get("cholesterol", ""),
-        "blood_pressure": raw_case.get("blood_pressure", ""),
-        "age": raw_case.get("age", ""),
-        "glucose": raw_case.get("glucose", ""),
-        "disease_type": _normalize_disease(raw_case.get("disease_type")),
-        "reason": reason,
+        PATIENT_ID_COLUMN: cleaned.get(PATIENT_ID_COLUMN) or _next_need_revise_patient_id(path),
+        "age": cleaned["age"],
+        "bmi": cleaned["bmi"],
+        "disease_type": cleaned["disease_type"],
+        "cholesterol": cleaned["cholesterol"],
+        "glucose": cleaned["glucose"],
+        "blood_pressure": cleaned["blood_pressure"],
+        TARGET_COLUMN: cleaned.get(TARGET_COLUMN, ""),
     }
 
+    revise_path = Path(path)
+    revise_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not revise_path.exists() or revise_path.stat().st_size == 0
+
     try:
-        with need_revise_path.open("a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=NEED_REVISE_COLUMNS)
+        with revise_path.open("a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=RAW_CASE_COLUMNS)
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
     except OSError as exc:
         return {
             "status": "QUEUE_WRITE_FAILED",
-            "message": (
-                "Case perlu revisi manual, tetapi file need_revise_case.csv "
-                "tidak dapat ditulis pada runtime ini."
-            ),
+            "message": "Case perlu revisi manual, tetapi file tidak dapat ditulis.",
             "queued_case": row,
             "error": str(exc),
         }
 
     return {
         "status": "QUEUED_FOR_EXPERT_REVISION",
-        "message": "Case disimpan ke need_revise_case.csv untuk direvisi manual.",
+        "message": "Case disimpan ke need_revise_case.csv untuk direvisi pakar.",
         "queued_case": row,
     }
 
 
-def disease_features(case: dict[str, Any]) -> list[str]:
-    return [column for column in case if column.startswith(DISEASE_PREFIX)]
-
-
-def disease_type(case: dict[str, Any]) -> str:
-    if "disease_type" in case:
-        return _normalize_disease(case["disease_type"])
-
-    columns = disease_features(case)
-    if not columns:
-        return "none"
-
-    selected_column = max(columns, key=lambda column: _to_float(case.get(column)))
-    return selected_column.replace(DISEASE_PREFIX, "")
-
-
-def preprocess_case(
-    raw_case: dict[str, Any],
-    template_case: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    processed = {}
-    missing_features = [feature for feature in RAW_NUMERIC_FEATURES if feature not in raw_case]
-    if missing_features:
-        raise ValueError(f"Input kurang fitur: {', '.join(missing_features)}")
-
-    for feature in RAW_NUMERIC_FEATURES:
-        processed[feature] = _normalize_feature(feature, raw_case[feature])
-
-    disease = _normalize_disease(raw_case.get("disease_type"))
-    disease_columns = disease_features(template_case or {})
-    if not disease_columns:
-        disease_columns = [
-            f"{DISEASE_PREFIX}diabetes",
-            f"{DISEASE_PREFIX}hypertension",
-            f"{DISEASE_PREFIX}none",
-            f"{DISEASE_PREFIX}obesity",
-        ]
-
-    known_diseases = {column.replace(DISEASE_PREFIX, "") for column in disease_columns}
-    if disease not in known_diseases:
-        raise ValueError(
-            "disease_type tidak dikenali. Gunakan salah satu: "
-            f"{', '.join(sorted(known_diseases))}."
-        )
-
-    for column in disease_columns:
-        processed[column] = 1.0 if column == f"{DISEASE_PREFIX}{disease}" else 0.0
-
-    if TARGET_COLUMN in raw_case:
-        processed[TARGET_COLUMN] = raw_case[TARGET_COLUMN]
-    if LABEL_COLUMN in raw_case:
-        processed[LABEL_COLUMN] = raw_case[LABEL_COLUMN]
-
-    return processed
-
-
-def local_similarity(query_case: dict[str, Any], db_case: dict[str, Any]) -> dict[str, float]:
-    similarities = {}
-
-    for feature in RAW_NUMERIC_FEATURES:
-        distance = abs(_to_float(query_case.get(feature)) - _to_float(db_case.get(feature)))
-        similarities[feature] = _clip(1.0 - distance)
-
-    similarities["disease_type"] = (
-        1.0 if disease_type(query_case) == disease_type(db_case) else 0.0
-    )
-
-    return similarities
-
-
-def weighted_euclidean_distance(query_case: dict[str, Any], db_case: dict[str, Any]) -> float:
-    total = 0.0
-
-    for feature in RAW_NUMERIC_FEATURES:
-        distance = _to_float(query_case.get(feature)) - _to_float(db_case.get(feature))
-        total += WEIGHTS[feature] * (distance**2)
-
-    disease_distance = 0.0 if disease_type(query_case) == disease_type(db_case) else 1.0
-    total += WEIGHTS["disease_type"] * (disease_distance**2)
-
-    return math.sqrt(total)
-
-
-def global_similarity(query_case: dict[str, Any], db_case: dict[str, Any]) -> float:
-    max_distance = math.sqrt(sum(WEIGHTS.values()))
-    distance = weighted_euclidean_distance(query_case, db_case)
-    similarity = 1.0 - (distance / max_distance)
-    return _clip(similarity)
-
-
-def _rank_cases(
-    processed_query: dict[str, Any],
-    cases: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    ranked_cases = []
-
-    for index, db_case in enumerate(cases):
-        similarities = local_similarity(processed_query, db_case)
-        distance = weighted_euclidean_distance(processed_query, db_case)
-        similarity = global_similarity(processed_query, db_case)
-
-        result = dict(db_case)
-        result["case_index"] = index
-        result["weighted_euclidean_distance"] = distance
-        result["global_similarity"] = similarity
-
-        for feature, score in similarities.items():
-            result[f"local_similarity_{feature}"] = score
-
-        ranked_cases.append(result)
-
-    ranked_cases.sort(
-        key=lambda case: (
-            -case["global_similarity"],
-            case["weighted_euclidean_distance"],
-        )
-    )
-    return ranked_cases
-
-
-def retrieve(
-    query_case: dict[str, Any],
-    case_base: list[dict[str, Any]] | None = None,
-    k: int = 5,
-    similarity_threshold: float = 0.75,
-) -> list[dict[str, Any]]:
-    if k <= 0:
-        raise ValueError("k harus lebih dari 0.")
-    if not 0.0 <= similarity_threshold <= 1.0:
-        raise ValueError("similarity_threshold harus berada pada rentang 0 sampai 1.")
-
-    cases = case_base if case_base is not None else load_case_base()
-    processed_query = preprocess_case(query_case, cases[0])
-    ranked_cases = _rank_cases(processed_query, cases)
-    return [
-        case
-        for case in ranked_cases
-        if case["global_similarity"] >= similarity_threshold
-    ][:k]
-
-
 def revise(
     query_case: dict[str, Any],
-    case_base: list[dict[str, Any]] | None = None,
-    k: int = 5,
+    retrieval_result: dict[str, Any] | None = None,
     need_revise_path: str | Path = DEFAULT_NEED_REVISE_PATH,
 ) -> dict[str, Any]:
-    if k <= 0:
-        raise ValueError("k harus lebih dari 0.")
-
-    cases = case_base if case_base is not None else load_case_base()
-    processed_query = None
-    nearest_cases = []
-
-    try:
-        processed_query = preprocess_case(query_case, cases[0])
-        nearest_cases = _rank_cases(processed_query, cases)[:k]
-    except ValueError as exc:
-        if "disease_type tidak dikenali" not in str(exc):
-            raise
-
     rule_result = revise_by_rules(query_case)
+    nearest_cases = (
+        retrieval_result.get("ranked_cases", [])[:5]
+        if retrieval_result is not None
+        else []
+    )
 
     if rule_result is not None:
         return {
             "diet_recommendation": rule_result["diet_recommendation"],
-            "diet_recommendation_label": rule_result["diet_recommendation_label"],
+            "diet_recommendation_label": rule_result["diet_recommendation"],
             "status": "REVISE",
             "revision_method": "RULE_BASED",
             "matched_rule": rule_result["rule"],
-            "message": (
-                "Tidak ada case yang memenuhi threshold. Rekomendasi dibuat "
-                "dengan proses revise berbasis rule."
-            ),
             "rule_reason": rule_result["reason"],
-            "global_similarity": (
-                nearest_cases[0]["global_similarity"] if nearest_cases else None
-            ),
-            "weighted_euclidean_distance": (
-                nearest_cases[0]["weighted_euclidean_distance"] if nearest_cases else None
-            ),
+            "message": "Rekomendasi dibuat dengan proses revise berbasis rule.",
             "top_cases": nearest_cases,
-            "processed_query": processed_query,
         }
 
-    queue_result = save_need_revise_case(
-        query_case,
-        reason="Tidak ada case yang memenuhi threshold dan tidak ada rule revise yang cocok.",
-        path=need_revise_path,
-    )
+    queue_result = save_need_revise_case(query_case, path=need_revise_path)
     return {
         "diet_recommendation": None,
         "diet_recommendation_label": None,
@@ -456,17 +519,68 @@ def revise(
         "revision_method": "MANUAL_QUEUE",
         "message": (
             "Tidak ada case yang memenuhi threshold dan tidak ada rule revise "
-            "yang cocok. Case sudah dimasukkan ke need_revise_case.csv."
-        ),
-        "global_similarity": (
-            nearest_cases[0]["global_similarity"] if nearest_cases else None
-        ),
-        "weighted_euclidean_distance": (
-            nearest_cases[0]["weighted_euclidean_distance"] if nearest_cases else None
+            "yang cocok. Case disimpan untuk direvisi pakar."
         ),
         "top_cases": nearest_cases,
-        "processed_query": processed_query,
         "need_revise": queue_result,
+    }
+
+
+def recommend(
+    query_case: dict[str, Any],
+    k: int = 5,
+    similarity_threshold: float = 0.75,
+    need_revise_path: str | Path = DEFAULT_NEED_REVISE_PATH,
+) -> dict[str, Any]:
+    cache = get_case_base_cache()
+    retrieval_result = retrieve(
+        query_case,
+        k=k,
+        similarity_threshold=similarity_threshold,
+        cache=cache,
+    )
+    top_cases = retrieval_result["cases"]
+
+    if not top_cases:
+        revised_result = revise(
+            query_case,
+            retrieval_result=retrieval_result,
+            need_revise_path=need_revise_path,
+        )
+        revised_result.update(
+            {
+                "threshold": similarity_threshold,
+                "index_key": retrieval_result["index_key"],
+                "candidate_count": retrieval_result["candidate_count"],
+                "used_fallback": retrieval_result["used_fallback"],
+                "processed_query": retrieval_result["processed_query"],
+            }
+        )
+        if revised_result.get("top_cases"):
+            best_case = revised_result["top_cases"][0]
+            revised_result["global_similarity"] = best_case["global_similarity"]
+            revised_result["weighted_euclidean_distance"] = best_case[
+                "weighted_euclidean_distance"
+            ]
+        else:
+            revised_result["global_similarity"] = None
+            revised_result["weighted_euclidean_distance"] = None
+        return revised_result
+
+    solution = _majority_vote(top_cases)
+    best_case = top_cases[0]
+    return {
+        "diet_recommendation": solution,
+        "diet_recommendation_label": solution,
+        "status": "REUSE",
+        "threshold": similarity_threshold,
+        "index_key": retrieval_result["index_key"],
+        "candidate_count": retrieval_result["candidate_count"],
+        "used_fallback": retrieval_result["used_fallback"],
+        "global_similarity": best_case["global_similarity"],
+        "weighted_euclidean_distance": best_case["weighted_euclidean_distance"],
+        "top_cases": top_cases,
+        "processed_query": retrieval_result["processed_query"],
     }
 
 
@@ -475,83 +589,24 @@ def retain_case(
     diet_recommendation: Any,
     path: str | Path = DEFAULT_CASE_BASE_PATH,
 ) -> dict[str, Any]:
-    case_base_path = Path(path)
-    columns = case_base_columns(case_base_path)
-    cases = load_case_base(case_base_path)
-    processed_case = preprocess_case(raw_case, cases[0])
-    processed_case[TARGET_COLUMN] = diet_recommendation
-    processed_case[LABEL_COLUMN] = solution_label(diet_recommendation)
+    columns = case_base_columns(path)
+    cleaned = _clean_raw_case(
+        {**raw_case, TARGET_COLUMN: diet_recommendation},
+        require_target=True,
+    )
+    if not cleaned.get(PATIENT_ID_COLUMN):
+        cleaned[PATIENT_ID_COLUMN] = f"PNEW{len(get_case_base_cache()['raw_cases']) + 1:04d}"
 
-    row = {column: processed_case.get(column, "") for column in columns}
-    with case_base_path.open("a", newline="", encoding="utf-8") as file:
+    row = {column: cleaned.get(column, "") for column in columns}
+    with Path(path).open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=columns)
         writer.writerow(row)
 
+    get_case_base_cache(force_reload=True)
     return {
         "status": "RETAIN",
         "message": "Case baru berhasil ditambahkan ke case base.",
         "retained_case": row,
-    }
-
-
-def recommend(
-    query_case: dict[str, Any],
-    k: int = 5,
-    similarity_threshold: float = 0.75,
-    retain_on_revise: bool = False,
-    retain_path: str | Path = DEFAULT_CASE_BASE_PATH,
-    need_revise_path: str | Path = DEFAULT_NEED_REVISE_PATH,
-) -> dict[str, Any]:
-    cases = load_case_base(retain_path)
-    try:
-        top_cases = retrieve(
-            query_case,
-            case_base=cases,
-            k=k,
-            similarity_threshold=similarity_threshold,
-        )
-    except ValueError as exc:
-        if "disease_type tidak dikenali" not in str(exc):
-            raise
-        top_cases = []
-
-    if not top_cases:
-        revised_result = revise(
-            query_case,
-            case_base=cases,
-            k=k,
-            need_revise_path=need_revise_path,
-        )
-        revised_result["threshold"] = similarity_threshold
-
-        if (
-            retain_on_revise
-            and revised_result["diet_recommendation"] is not None
-            and revised_result.get("processed_query") is not None
-        ):
-            retain_result = retain_case(
-                query_case,
-                revised_result["diet_recommendation"],
-                path=retain_path,
-            )
-            revised_result["retain"] = retain_result
-
-        return revised_result
-
-    best_case = top_cases[0]
-    processed_query = preprocess_case(query_case, cases[0])
-    return {
-        "diet_recommendation": best_case[TARGET_COLUMN],
-        "diet_recommendation_label": best_case.get(
-            LABEL_COLUMN,
-            solution_label(best_case[TARGET_COLUMN]),
-        ),
-        "status": "REUSE",
-        "threshold": similarity_threshold,
-        "global_similarity": best_case["global_similarity"],
-        "weighted_euclidean_distance": best_case["weighted_euclidean_distance"],
-        "top_cases": top_cases,
-        "processed_query": processed_query,
     }
 
 
@@ -564,21 +619,7 @@ if __name__ == "__main__":
         "glucose": 145,
         "disease_type": "diabetes",
     }
-
-    threshold = 0.75
-    result = recommend(sample_query, k=5, similarity_threshold=threshold)
-
+    result = recommend(sample_query, k=5, similarity_threshold=0.75)
     print("Status:", result["status"])
-    print("Threshold:", result["threshold"])
-    print("Recommendation:", result["diet_recommendation"])
-    print("Global similarity:", round(result["global_similarity"], 4))
-    print("Weighted euclidean distance:", round(result["weighted_euclidean_distance"], 4))
-
-    print("\nTop cases:")
-    for case in result["top_cases"]:
-        print(
-            f"case={case['case_index']}, "
-            f"target={case[TARGET_COLUMN]}, "
-            f"similarity={case['global_similarity']:.4f}, "
-            f"distance={case['weighted_euclidean_distance']:.4f}"
-        )
+    print("Index key:", result["index_key"])
+    print("Recommendation:", result["diet_recommendation_label"])
