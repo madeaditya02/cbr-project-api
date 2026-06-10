@@ -85,7 +85,7 @@ def predict():
 
     try:
         k = _as_int_query("k", 5)
-        threshold = _as_float_query("threshold", 0.75)
+        threshold = _as_float_query("threshold", 0.90)
         result = recommend(payload, k=k, similarity_threshold=threshold)
     except ValueError as exc:
         return _json_error(str(exc), 400)

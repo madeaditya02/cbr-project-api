@@ -407,7 +407,7 @@ def revise_by_rules(raw_case: dict[str, Any]) -> dict[str, Any] | None:
 
     if disease == "diabetes" or case["glucose"] >= 126:
         return {
-            "diet_recommendation": "low_carb",
+            "diet_recommendation": "low_carb_restrict",
             "rule": "diabetes_or_high_glucose",
             "reason": "disease_type diabetes atau glucose >= 126.",
         }
@@ -428,7 +428,7 @@ def revise_by_rules(raw_case: dict[str, Any]) -> dict[str, Any] | None:
 
     if case["cholesterol"] >= 240:
         return {
-            "diet_recommendation": "balanced",
+            "diet_recommendation": "low_fat",
             "rule": "high_cholesterol",
             "reason": "cholesterol >= 240.",
         }
@@ -562,6 +562,18 @@ def recommend(
             revised_result["weighted_euclidean_distance"] = best_case[
                 "weighted_euclidean_distance"
             ]
+            
+            # Mencegah duplikasi: Hanya retain jika similarity tertinggi (global_similarity)
+            # masih di bawah 99%. Jika 99% atau 100%, berarti kasus ini sudah ada di database,
+            similarity = revised_result.get('global_similarity')
+            
+            if similarity is None or similarity < 0.99:
+                print("[SYSTEM] Kasus Rule-Based baru terdeteksi. Menyimpan ke Case Base...")
+                # Simpan diam-diam di background
+                retain_case(query_case, revised_result['diet_recommendation'])
+                revised_result['retain_status'] = "AUTO_RETAINED"
+            else:
+                revised_result['retain_status'] = "IGNORED_DUPLICATE"
         else:
             revised_result["global_similarity"] = None
             revised_result["weighted_euclidean_distance"] = None
