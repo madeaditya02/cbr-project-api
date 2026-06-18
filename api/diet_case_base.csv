@@ -999,3 +999,7 @@ P0997,35,35.6,hypertension,172.2,78.6,126,low_sodium
 P0998,49,16.9,obesity,228.0,70.2,148,balanced
 P0999,64,19.5,diabetes,170.1,138.0,177,low_carb
 P1000,66,26.9,obesity,158.0,114.7,164,balanced
+PNEW1002,18.0,8.89,none,250.0,125.0,118.0,low_fat
+PNEW1002,38.0,24.57,none,250.0,125.0,118.0,low_fat
+REV0002,18.0,8.89,none,180.0,100.0,100.0,low protein
+REV0003,18.0,8.89,none,180.0,100.0,100.0,low protein

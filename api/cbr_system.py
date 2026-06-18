@@ -25,6 +25,7 @@ RAW_CASE_COLUMNS = [
     "blood_pressure",
     TARGET_COLUMN,
 ]
+NEED_REVISE_COLUMNS = RAW_CASE_COLUMNS + ["status"]
 
 DISEASE_ALIASES = {
     "": "none",
@@ -106,6 +107,8 @@ def _clean_raw_case(row: dict[str, Any], require_target: bool = True) -> dict[st
         cleaned[TARGET_COLUMN] = _normalize_target(row[TARGET_COLUMN])
     elif TARGET_COLUMN in row:
         cleaned[TARGET_COLUMN] = _normalize_target(row[TARGET_COLUMN])
+    
+    # print(cleaned)
 
     return cleaned
 
@@ -344,6 +347,7 @@ def _rank_indexed_candidates(
         result["index_key"] = index_key
         result["weighted_euclidean_distance"] = distance
         result["global_similarity"] = similarity
+        # print(result)
         ranked.append(result)
 
     ranked.sort(key=lambda case: (case["weighted_euclidean_distance"], -case["global_similarity"]))
@@ -390,6 +394,7 @@ def retrieve(
         for case in ranked
         if case["global_similarity"] >= similarity_threshold
     ][:k]
+    # print(qualified)
 
     return {
         "cases": qualified,
@@ -460,6 +465,7 @@ def save_need_revise_case(
         "glucose": cleaned["glucose"],
         "blood_pressure": cleaned["blood_pressure"],
         TARGET_COLUMN: cleaned.get(TARGET_COLUMN, ""),
+        "status": "pending",
     }
 
     revise_path = Path(path)
@@ -468,7 +474,7 @@ def save_need_revise_case(
 
     try:
         with revise_path.open("a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=RAW_CASE_COLUMNS)
+            writer = csv.DictWriter(file, fieldnames=NEED_REVISE_COLUMNS)
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
@@ -539,9 +545,10 @@ def recommend(
         similarity_threshold=similarity_threshold,
         cache=cache,
     )
-    top_cases = retrieval_result["cases"]
-
-    if not top_cases:
+    top_cases = retrieval_result["ranked_cases"]
+    # print(retrieval_result['cases'])
+    if not retrieval_result['cases']:
+        print("Revised")
         revised_result = revise(
             query_case,
             retrieval_result=retrieval_result,
@@ -579,11 +586,12 @@ def recommend(
             revised_result["weighted_euclidean_distance"] = None
         return revised_result
 
-    solution = _majority_vote(top_cases)
-    best_case = top_cases[0]
+    # solution = _majority_vote(top_cases)
+    best_case = retrieval_result['cases'][0]
+    solution = best_case['diet_recommendation']
     return {
         "diet_recommendation": solution,
-        "diet_recommendation_label": solution,
+        "diet_recommendation_label": solution.replace("_", " ").title(),
         "status": "REUSE",
         "threshold": similarity_threshold,
         "index_key": retrieval_result["index_key"],

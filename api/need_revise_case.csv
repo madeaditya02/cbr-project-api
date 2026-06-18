@@ -1,0 +1,5 @@
+patient_id,age,bmi,disease_type,cholesterol,glucose,blood_pressure,diet_recommendation,status
+REV0001,18.0,8.89,none,180.0,100.0,100.0,low carb restrict,revised
+REV0002,18.0,8.89,none,180.0,100.0,100.0,low protein,revised
+REV0003,18.0,8.89,none,180.0,100.0,100.0,low protein,revised
+REV0004,18.0,8.89,none,180.0,100.0,100.0,,pending

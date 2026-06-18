@@ -1,0 +1,2 @@
+id,name,email,password
+1,dr. Wayan,pakar@example.com,scrypt:32768:8:1$wf6fBiK7RgbaJLsV$d54d8acdc5bc39f99b138680165cc07c5d4db546f7051fb7e1d4213d0747172f2864449272ccb97335502b4c53d5af480a0f680dead7c21062414a0fada09f64
